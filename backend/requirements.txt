@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pypdf
+openai>=1.30.0
+httpx
+supabase>=2.0.0
+python-multipart
+pydantic-settings
