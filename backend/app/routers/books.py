@@ -1,98 +1,102 @@
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
-from pydantic import BaseModel
+import asyncio
 
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+
+from ..config import settings
 from ..deps import get_supabase_client
 from ..schemas import (
-    AudioGenerationOut,
+    AudioJobOut,
     BookCreate,
     BookDetailOut,
     BookOut,
+    ChapterIn,
+    DeleteBookOut,
     EnrichmentOut,
-    EpisodeOut,
-    ExtractPreview,
+    ExtractionJobOut,
+    FromExtractionIn,
     PersistedBookOut,
     SegmentedBook,
 )
-from ..services import enrichment_service, pdf_service, segmentation_service, tts_service
+from ..services import enrichment_service, pdf_service, pipeline_service
+from ..services.storage_paths import public_url_to_path
 
 router = APIRouter(prefix="/api/books", tags=["books"])
 
 
-class ExtractedPayload(BaseModel):
-    filename: str
-    segmented: SegmentedBook
-    cover_url: str = ""
-    description: str = ""
-    num_pages: int = 0
-    front_matter_pages: int = 0
-    front_matter_text: str = ""
-
-
-_last_extraction: dict[str, ExtractedPayload] = {}
-
-
-@router.post("/extract", response_model=ExtractPreview)
-async def extract_pdf(file: UploadFile = File(...)):
+@router.post("/extract", response_model=ExtractionJobOut, status_code=202)
+async def extract_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Enqueue full-book extraction: ALL pages are parsed and segmented in
+    token-budgeted windows in a background task. Poll
+    GET /extract/jobs/{job_id} for status; chapter bodies stay backend-side
+    (persist via POST /from-extraction with the job id)."""
     if file.content_type not in ("application/pdf", "application/octet-stream", None):
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported.")
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    # Reject corrupt PDFs synchronously so the client gets a 400, not a
+    # failed background job.
     try:
-        extracted = pdf_service.extract_pdf(data)
-        print(f"Extracted {extracted.num_pages} pages, front matter: {extracted.front_matter_pages} pages")
+        await _probe_pdf(data)
     except Exception as exc:  # invalid/corrupt PDF
         raise HTTPException(status_code=400, detail=f"Could not parse PDF: {exc}") from exc
-    try:
-        segmented = await segmentation_service.segment_front_matter(extracted.front_matter_text)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Chapter segmentation failed: {exc}") from exc
-    cover_url, description = await enrichment_service.enrich_metadata(segmented.title, segmented.author)
-    _last_extraction["latest"] = ExtractedPayload(
-        filename=file.filename or "upload.pdf",
-        segmented=segmented,
-        cover_url=cover_url,
-        description=description,
-        num_pages=extracted.num_pages,
-        front_matter_pages=extracted.front_matter_pages,
-        front_matter_text=extracted.front_matter_text,
+
+    filename = file.filename or "upload.pdf"
+    job = await pipeline_service.create_job("extraction", filename=filename)
+
+    background_tasks.add_task(pipeline_service.run_extraction_job, job.job_id, filename, data)
+    return _extraction_job_out(job)
+
+
+def _extraction_job_out(job) -> ExtractionJobOut:
+    # Chapter previews only (index + title): bodies never leave the backend.
+    previews = [
+        {"chapter_index": c.get("chapter_index"), "title": c.get("title", "")}
+        for c in (job.chapters or [])
+        if isinstance(c, dict) and isinstance(c.get("chapter_index"), int)
+    ]
+    return ExtractionJobOut(
+        job_id=job.job_id,
+        kind=job.kind,
+        status=job.status,
+        filename=job.filename,
+        num_pages=job.num_pages,
+        total_chapters=job.total_chapters,
+        title=job.title,
+        author=job.author,
+        cover_url=job.cover_url,
+        description=job.description,
+        chapters=previews,
+        error=job.error,
     )
-    payload = _last_extraction["latest"]
-    return ExtractPreview(
-        filename=payload.filename,
-        num_pages=payload.num_pages,
-        front_matter_pages=payload.front_matter_pages,
-        front_matter_text=payload.front_matter_text,
-    )
 
 
-@router.get("/extract/preview")
-async def extract_preview():
-    payload = _last_extraction.get("latest")
-    if payload is None:
-        raise HTTPException(status_code=404, detail="No extraction has been run yet.")
-    return {
-        "filename": payload.filename,
-        "title": payload.segmented.title,
-        "author": payload.segmented.author,
-        "cover_url": payload.cover_url,
-        "description": payload.description,
-        "chapters": [c.model_dump() for c in payload.segmented.chapters],
-    }
+async def _probe_pdf(data: bytes) -> int:
+    """Validate the PDF synchronously; returns the page count."""
+    pages = await asyncio.to_thread(pdf_service.extract_pages, data)
+    if not pages:
+        raise ValueError("PDF has no readable pages.")
+    return len(pages)
 
 
-@router.post("", response_model=PersistedBookOut, status_code=201)
-async def create_book(body: BookCreate):
-    supabase = await get_supabase_client()
+@router.get("/extract/jobs/{job_id}", response_model=ExtractionJobOut)
+async def get_extraction_job(job_id: str):
+    job = await pipeline_service.get_job(job_id)
+    if job is None or job.kind != "extraction":
+        raise HTTPException(status_code=404, detail="Extraction job not found.")
+    return _extraction_job_out(job)
+
+
+async def _persist_book(supabase, title: str, author: str, description: str, cover_url: str, chapters):
     book_res = (
         await supabase.table("books")
         .insert(
             {
-                "title": body.title,
-                "author": body.author,
-                "description": body.description,
-                "cover_url": body.cover_url,
-                "total_chapters": len(body.chapters),
+                "title": title,
+                "author": author,
+                "description": description,
+                "cover_url": cover_url,
+                "total_chapters": len(chapters),
             }
         )
         .execute()
@@ -101,7 +105,7 @@ async def create_book(body: BookCreate):
         raise HTTPException(status_code=502, detail="Failed to persist book.")
     book = book_res.data[0]
     episodes: list[dict] = []
-    if body.chapters:
+    if chapters:
         rows = [
             {
                 "book_id": book["id"],
@@ -110,11 +114,53 @@ async def create_book(body: BookCreate):
                 "duration": 0,
                 "audio_url": "",
             }
-            for ch in body.chapters
+            for ch in chapters
         ]
         ep_res = await supabase.table("episodes").insert(rows).execute()
         episodes = ep_res.data or []
     return {"book": book, "episodes": episodes}
+
+
+@router.post("", response_model=PersistedBookOut, status_code=201)
+async def create_book(body: BookCreate):
+    supabase = await get_supabase_client()
+    return await _persist_book(
+        supabase, body.title, body.author, body.description, body.cover_url, body.chapters
+    )
+
+
+@router.post("/from-extraction", response_model=PersistedBookOut, status_code=201)
+async def create_book_from_extraction(body: FromExtractionIn):
+    """Persist a finished extraction job without the client resending text.
+
+    Reads the chapters stored backend-side by the extraction job, so the
+    extracted text is passed backend-only with no frontend round trip.
+    """
+    job = await pipeline_service.get_job(body.job_id)
+    if job is None or job.kind != "extraction":
+        raise HTTPException(status_code=404, detail="Extraction job not found.")
+    if job.status != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Extraction job is {job.status}; wait for it to finish first."
+            if job.status in ("queued", "running")
+            else f"Extraction job failed: {job.error or 'unknown error'}",
+        )
+    try:
+        chapters = [ChapterIn(**c) for c in job.chapters]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Stored chapters are invalid: {exc}") from exc
+    if not chapters:
+        raise HTTPException(status_code=409, detail="Extraction produced no chapters.")
+
+    supabase = await get_supabase_client()
+    saved = await _persist_book(
+        supabase, job.title, job.author, job.description, job.cover_url, chapters
+    )
+    # Hold the bodies backend-side so audio generation needs no chapter text
+    # from the client.
+    await pipeline_service.remember_book_chapters(saved["book"]["id"], chapters)
+    return saved
 
 
 @router.get("", response_model=list[BookOut])
@@ -140,38 +186,122 @@ async def get_book(book_id: str):
     return {**book_res.data, "episodes": ep_res.data or []}
 
 
-@router.post("/{book_id}/generate-audio", response_model=AudioGenerationOut)
-async def generate_audio(book_id: str, background_tasks: BackgroundTasks, body: SegmentedBook):
+@router.post("/{book_id}/generate-audio", response_model=AudioJobOut, status_code=202)
+async def generate_audio(book_id: str, background_tasks: BackgroundTasks, body: SegmentedBook | None = None):
+    """Enqueue the parallel TTS pipeline: one worker per chapter, each
+    chapter's chunks synthesized concurrently. Poll GET /audio/jobs/{job_id}.
+
+    Chapter text comes from the backend store (persisted via
+    POST /from-extraction); pass an explicit body only to synthesize
+    client-supplied chapters instead.
+    """
+    supabase = await get_supabase_client()
+    book_res = await supabase.table("books").select("id").eq("id", book_id).single().execute()
+    if not book_res.data:
+        raise HTTPException(status_code=404, detail="Book not found.")
+    if body is not None and body.chapters:
+        chapters = body.chapters
+        await pipeline_service.remember_book_chapters(book_id, chapters)
+    else:
+        chapters = await pipeline_service.get_book_chapters(book_id)
+        if not chapters:
+            raise HTTPException(
+                status_code=400,
+                detail="No chapter text stored for this book; persist it via "
+                "POST /api/books/from-extraction first, or pass chapters in the body.",
+            )
+
+    job = await pipeline_service.create_job("audio", book_id=book_id)
+
+    async def _persist(result: dict) -> None:
+        client = await get_supabase_client()
+        await client.table("episodes").upsert(
+            {
+                "book_id": book_id,
+                "episode_number": result["episode_number"],
+                "title": result["title"],
+                "duration": result["duration"],
+                "audio_url": result["audio_url"],
+            },
+            on_conflict="book_id,episode_number",
+        ).execute()
+
+    background_tasks.add_task(pipeline_service.run_audio_job, job.job_id, book_id, chapters, _persist)
+    stored = await pipeline_service.get_job(job.job_id)
+    assert stored is not None
+    return AudioJobOut(
+        job_id=stored.job_id,
+        kind=stored.kind,
+        status=stored.status,
+        book_id=book_id,
+        total_chapters=len(chapters),
+    )
+
+
+@router.get("/audio/jobs/{job_id}", response_model=AudioJobOut)
+async def get_audio_job(job_id: str):
+    job = await pipeline_service.get_job(job_id)
+    if job is None or job.kind != "audio":
+        raise HTTPException(status_code=404, detail="Audio job not found.")
+    return AudioJobOut(
+        job_id=job.job_id,
+        kind=job.kind,
+        status=job.status,
+        book_id=job.book_id,
+        total_chapters=job.total_chapters,
+        done_chapters=job.done_chapters,
+        failed_chapters=job.failed_chapters,
+        error=job.error,
+    )
+
+
+@router.delete("/{book_id}", response_model=DeleteBookOut)
+async def delete_book(book_id: str):
+    """Delete an audiobook: stop its pipelines, remove MP3s from the
+    bucket, then remove episode rows and the book row."""
     supabase = await get_supabase_client()
     book_res = await supabase.table("books").select("id").eq("id", book_id).single().execute()
     if not book_res.data:
         raise HTTPException(status_code=404, detail="Book not found.")
 
-    async def _run():
-        client = await get_supabase_client()
-        for ch in body.chapters:
-            result = await tts_service.generate_chapter_audio(
-                book_id, ch.chapter_index, ch.title, ch.body
-            )
-            await client.table("episodes").upsert(
-                {
-                    "book_id": book_id,
-                    "episode_number": result["episode_number"],
-                    "title": result["title"],
-                    "duration": result["duration"],
-                    "audio_url": result["audio_url"],
-                },
-                on_conflict="book_id,episode_number",
-            ).execute()
+    # Stop background TTS first and wait for workers to drain, so no new
+    # files are uploaded or episode rows resurrected after the delete.
+    await pipeline_service.cancel_book_jobs(book_id)
+    await pipeline_service.wait_for_audio_jobs(book_id)
 
-    background_tasks.add_task(_run)
-    existing = (
-        await supabase.table("episodes").select("*").eq("book_id", book_id).order("episode_number").execute()
+    ep_res = (
+        await supabase.table("episodes").select("audio_url").eq("book_id", book_id).execute()
     )
-    return {
-        "book_id": book_id,
-        "episodes": [EpisodeOut(**row) for row in (existing.data or [])],
-    }
+    paths: set[str] = set()
+    for row in ep_res.data or []:
+        path = public_url_to_path(row.get("audio_url") or "", settings.audiobooks_bucket)
+        if path:
+            paths.add(path)
+    # Belt and braces: also list everything stored under the book prefix so
+    # orphaned files (e.g. from a chapter that never got its URL saved) go too.
+    try:
+        listed = await supabase.storage.from_(settings.audiobooks_bucket).list(book_id)
+    except Exception:
+        listed = []
+    for entry in listed or []:
+        name = (entry or {}).get("name")
+        if name:
+            paths.add(f"{book_id}/{name}")
+
+    removed_files = 0
+    if paths:
+        try:
+            await supabase.storage.from_(settings.audiobooks_bucket).remove(sorted(paths))
+            removed_files = len(paths)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Could not remove audio files: {exc}"
+            ) from exc
+
+    await supabase.table("episodes").delete().eq("book_id", book_id).execute()
+    await supabase.table("books").delete().eq("id", book_id).execute()
+    await pipeline_service.forget_book_chapters(book_id)
+    return {"book_id": book_id, "removed_files": removed_files}
 
 
 @router.get("/enrich/lookup", response_model=EnrichmentOut)

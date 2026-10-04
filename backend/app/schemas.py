@@ -68,6 +68,52 @@ class AudioGenerationOut(BaseModel):
     episodes: list[EpisodeOut]
 
 
+class ChapterPreview(BaseModel):
+    """Chapter listing for the extraction status poll: index + title only.
+
+    Full chapter bodies stay backend-side (job store → persist → audio);
+    the frontend never round-trips extracted text.
+    """
+
+    chapter_index: int = Field(ge=1)
+    title: str
+
+
+class FromExtractionIn(BaseModel):
+    job_id: str
+
+
+class ExtractionJobOut(BaseModel):
+    job_id: str
+    kind: str = "extraction"
+    status: str
+    filename: str = ""
+    num_pages: int = 0
+    total_chapters: int = 0
+    title: str = ""
+    author: str = ""
+    cover_url: str = ""
+    description: str = ""
+    chapters: list[ChapterPreview] = []
+    error: str = ""
+
+
+class AudioJobOut(BaseModel):
+    job_id: str
+    kind: str = "audio"
+    status: str
+    book_id: str = ""
+    total_chapters: int = 0
+    done_chapters: int = 0
+    failed_chapters: int = 0
+    error: str = ""
+
+
+class DeleteBookOut(BaseModel):
+    book_id: str
+    removed_files: int = 0
+
+
 class PdfMetadata(BaseModel):
     title: Optional[str] = None
     author: Optional[str] = None

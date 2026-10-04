@@ -1,0 +1,43 @@
+# BookReader tuning valves.
+#
+# Single place to tune the extraction / segmentation / TTS pipeline.
+# Environment variables (see backend/.env.example) override these values.
+# Secrets (API keys, Supabase credentials) stay in the environment only.
+
+[openai]
+segmentation_model = "gpt-4o-mini"
+tts_model = "tts-1"
+tts_voice = "alloy"
+# Output cap requested per segmentation call. Must fit the model's token
+# limit — e.g. 3000 for a model whose limit is 3000 tokens.
+segmentation_max_tokens = 3000
+
+[segmentation]
+# Input budget per segmentation request, in tokens. Page text is packed
+# into windows that fit this budget, so oversized books never blow the
+# model's token limit. E.g. 3000 for a 3000-token model.
+token_limit = 3000
+# Rough chars-per-token estimate used to size windows without a tokenizer.
+chars_per_token = 4.0
+# Sentence splitter backend: "stdlib" (built-in) or "langchain"
+# (RecursiveCharacterTextSplitter; needs the langchain-text-splitters
+# package installed — left for you to install).
+text_splitter = "stdlib"
+# Overlap (chars) between langChain windows; 0 disables. Stdlib ignores it.
+text_splitter_overlap = 0
+# Extra attempts after the first failed segmentation call.
+max_retries = 1
+
+[extraction]
+# Max pages packed into one segmentation window (token budget applies first).
+batch_pages = 25
+front_matter_min_pages = 15
+front_matter_max_pages = 25
+
+[tts]
+max_chunk_chars = 4000
+max_concurrency = 4
+chunk_concurrency = 5
+
+[app]
+audiobooks_bucket = "audiobooks"

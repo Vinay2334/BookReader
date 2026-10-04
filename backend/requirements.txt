@@ -6,3 +6,6 @@ httpx
 supabase>=2.0.0
 python-multipart
 pydantic-settings
+# Optional: uncomment + install to enable SEGMENTATION_TEXT_SPLITTER=langchain
+# (RecursiveCharacterTextSplitter for window/chunk splitting).
+# langchain-text-splitters

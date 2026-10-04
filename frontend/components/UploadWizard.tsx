@@ -1,9 +1,16 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileUp, Loader2, X } from "lucide-react";
-import { extractPdf, generateAudio, persistBook, type ExtractionPreview } from "@/lib/api";
+import {
+  extractPdf,
+  generateAudio,
+  getAudioJob,
+  persistFromExtraction,
+  type ExtractionJob,
+  type ExtractionPreview,
+} from "@/lib/api";
 
 type Step = 1 | 2 | 3;
 
@@ -12,30 +19,43 @@ export function UploadWizard({ onClose }: { onClose: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<ExtractionPreview | null>(null);
   const [bookId, setBookId] = useState<string | null>(null);
+  const [extractJob, setExtractJob] = useState<ExtractionJob | null>(null);
+  const [audioJobId, setAudioJobId] = useState<string | null>(null);
   const [error, setError] = useState<string>("");
   const queryClient = useQueryClient();
 
   const extractMutation = useMutation({
-    mutationFn: (f: File) => extractPdf(f),
+    mutationFn: (f: File) => extractPdf(f, setExtractJob),
     onSuccess: (data) => {
       setPreview(data);
       setStep(2);
     },
-    onError: () => setError("Extraction failed. Check the API connection and try again."),
+    onError: (e) =>
+      setError(
+        e instanceof Error && e.message
+          ? e.message
+          : "Extraction failed. Check the API connection and try again.",
+      ),
+  });
+
+  const audioJobQuery = useQuery({
+    queryKey: ["audio-job", audioJobId],
+    queryFn: () => getAudioJob(audioJobId as string),
+    enabled: step === 3 && audioJobId !== null,
+    refetchInterval: (data) => {
+      const s = data?.status;
+      return s === "done" || s === "failed" || s === "cancelled" ? false : 2000;
+    },
   });
 
   const publishMutation = useMutation({
     mutationFn: async () => {
       if (!preview) throw new Error("Nothing to publish");
-      const saved = await persistBook({
-        title: preview.title,
-        author: preview.author,
-        description: preview.description,
-        cover_url: preview.cover_url,
-        chapters: preview.chapters,
-      });
+      // Chapters stay backend-side: persist + synthesize by extraction job id.
+      const saved = await persistFromExtraction(preview.jobId);
       setBookId(saved.book.id);
-      await generateAudio(saved.book.id, preview.chapters, preview.title, preview.author);
+      const job = await generateAudio(saved.book.id);
+      setAudioJobId(job.job_id);
       return saved;
     },
     onSuccess: () => {
@@ -110,12 +130,23 @@ export function UploadWizard({ onClose }: { onClose: () => void }) {
             </label>
             <button
               disabled={!file || busy}
-              onClick={() => file && extractMutation.mutate(file)}
+              onClick={() => {
+                setError("");
+                setExtractJob(null);
+                if (file) extractMutation.mutate(file);
+              }}
               className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-full bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
             >
               {busy && <Loader2 className="h-4 w-4 animate-spin" />}
               Extract chapters
             </button>
+            {extractMutation.isPending && (
+              <p className="mt-3 text-center text-xs text-zinc-500">
+                {extractJob && extractJob.num_pages > 0
+                  ? `Parsing full book (${extractJob.num_pages} pages) and segmenting chapters…`
+                  : "Uploading and starting background extraction…"}
+              </p>
+            )}
           </div>
         )}
 
@@ -164,10 +195,37 @@ export function UploadWizard({ onClose }: { onClose: () => void }) {
 
         {step === 3 && (
           <div className="mt-6 text-center">
-            <p className="text-sm text-zinc-600 dark:text-zinc-300">
-              Your audiobook is being generated in the background.
-              {bookId && " You can open it from your library once chapters finish."}
-            </p>
+            {(() => {
+              const job = audioJobQuery.data;
+              const total = job?.total_chapters ?? preview?.chapters.length ?? 0;
+              const done = job?.done_chapters ?? 0;
+              const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+              return (
+                <>
+                  <p className="text-sm text-zinc-600 dark:text-zinc-300">
+                    {job?.status === "done"
+                      ? `All ${total} chapters have audio.`
+                      : job?.status === "failed"
+                        ? `Audio generation stopped: ${job.error || "a chapter failed."}`
+                        : job?.status === "cancelled"
+                          ? "Audio generation was cancelled."
+                          : `Generating audio in parallel — ${done} of ${total} chapters done.`}
+                    {bookId && " You can open it from your library once chapters finish."}
+                  </p>
+                  <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
+                    <div
+                      className="h-full rounded-full bg-zinc-900 transition-all dark:bg-zinc-100"
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  {(job?.failed_chapters ?? 0) > 0 && (
+                    <p className="mt-2 text-xs text-red-500">
+                      {job?.failed_chapters} chapter(s) failed to synthesize.
+                    </p>
+                  )}
+                </>
+              );
+            })()}
             <button
               onClick={onClose}
               className="mt-5 inline-flex items-center justify-center rounded-full border border-zinc-300 px-5 py-2 text-sm font-medium dark:border-zinc-700"

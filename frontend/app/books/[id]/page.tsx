@@ -1,10 +1,12 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { ArrowLeft, Play } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { ArrowLeft, Play, Trash2 } from "lucide-react";
 import { ChapterList } from "@/components/ChapterList";
-import { getBook } from "@/lib/api";
+import { deleteBook, getBook } from "@/lib/api";
 import { usePlayerStore } from "@/store/player-store";
 
 function formatDuration(totalSeconds: number): string {
@@ -19,6 +21,22 @@ export default function BookDetailPage({ params }: { params: { id: string } }) {
     queryFn: () => getBook(params.id),
   });
   const play = usePlayerStore((s) => s.play);
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+
+  const deleteMutation = useMutation({
+    mutationFn: () => deleteBook(params.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["books"] });
+      router.push("/");
+    },
+    onError: () => {
+      setConfirmingDelete(false);
+      setDeleteError("Could not delete this audiobook. Please try again.");
+    },
+  });
 
   if (isLoading) return <p className="text-sm text-zinc-500">Loading book…</p>;
   if (isError || !book) return <p className="text-sm text-red-500">Book not found.</p>;
@@ -62,22 +80,45 @@ export default function BookDetailPage({ params }: { params: { id: string } }) {
               {book.description}
             </p>
           )}
-          <button
-            disabled={!firstPlayable}
-            onClick={() =>
-              firstPlayable &&
-              play({
-                episodeId: firstPlayable.id,
-                bookId: book.id,
-                bookTitle: book.title,
-                chapterTitle: firstPlayable.title,
-                audioUrl: firstPlayable.audio_url,
-              })
-            }
-            className="mt-6 inline-flex items-center gap-2 rounded-full bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
-          >
-            <Play className="h-4 w-4" /> Listen Now
-          </button>
+          <div className="mt-6 flex flex-wrap items-center gap-3">
+            <button
+              disabled={!firstPlayable}
+              onClick={() =>
+                firstPlayable &&
+                play({
+                  episodeId: firstPlayable.id,
+                  bookId: book.id,
+                  bookTitle: book.title,
+                  chapterTitle: firstPlayable.title,
+                  audioUrl: firstPlayable.audio_url,
+                })
+              }
+              className="inline-flex items-center gap-2 rounded-full bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
+            >
+              <Play className="h-4 w-4" /> Listen Now
+            </button>
+            <button
+              disabled={deleteMutation.isPending}
+              onClick={() => {
+                if (confirmingDelete) {
+                  deleteMutation.mutate();
+                } else {
+                  setDeleteError("");
+                  setConfirmingDelete(true);
+                }
+              }}
+              onBlur={() => setConfirmingDelete(false)}
+              className="inline-flex items-center gap-2 rounded-full border border-red-300 px-5 py-2.5 text-sm font-medium text-red-600 disabled:opacity-40 dark:border-red-900 dark:text-red-400"
+            >
+              <Trash2 className="h-4 w-4" />
+              {deleteMutation.isPending
+                ? "Deleting…"
+                : confirmingDelete
+                  ? "Click again to confirm"
+                  : "Delete audiobook"}
+            </button>
+          </div>
+          {deleteError && <p className="mt-3 text-sm text-red-500">{deleteError}</p>}
         </div>
       </div>
 
